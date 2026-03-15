@@ -79,23 +79,23 @@ def call_openai_plausibility(company, industry):
     if not api_key:
         return None
 
-    # try:
-        # from openai import OpenAI
-    # except ImportError:
-        # return None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None
 
-    # try:
-        # client = OpenAI(api_key=api_key)
-        # response = client.chat.completions.create(
-            # model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            # messages=[
-                # {"role": "user", "content": build_llm_prompt(company, industry)}
-            # ],
-            # temperature=0,
-            # max_tokens=3,
-        # )
-    # except Exception:
-        # return None
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            messages=[
+                {"role": "user", "content": build_llm_prompt(company, industry)}
+            ],
+            temperature=0,
+            max_tokens=3,
+        )
+    except Exception:
+        return None
 
     content = response.choices[0].message.content or ""
     verdict = content.strip().upper()
@@ -138,7 +138,7 @@ def main():
     df["flag_invalid_year"] = "OK"
     df.loc[year_blank | ~valid_year_number | ~valid_year_range, "flag_invalid_year"] = "FAIL"
 
-    # Measure 4: Outlier detection within providerkey groups
+     # Measure 4: Outlier detection within providerkey groups
     provider_mean = df.groupby("providerkey")["revenue_numeric"].transform("mean")
     provider_std = df.groupby("providerkey")["revenue_numeric"].transform("std")
     provider_count = df.groupby("providerkey")["revenue_numeric"].transform("count")
