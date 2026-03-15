@@ -10,6 +10,7 @@ import pandas as pd
 INPUT_FILE = "CaseStudy_Quality_sample25.xlsx"
 OUTPUT_FILE = "CaseStudy_Quality_Checked.xlsx"
 
+# these are the columns we need - script will throw early if any are missing
 REQUIRED_COLUMNS = [
     "REVENUE",
     "unit_REVENUE",
@@ -21,18 +22,21 @@ REQUIRED_COLUMNS = [
 
 
 def is_blank(value):
+    # covers NaN, None, empty strings and accidental whitespace
     if pd.isna(value):
         return True
     return str(value).strip() == ""
 
 
 def to_numeric(series):
+    # some values come in as "1,000,000" strings from scraping so strip commas first
     cleaned = series.astype("string").str.replace(",", "", regex=False).str.strip()
     cleaned = cleaned.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
     return pd.to_numeric(cleaned, errors="coerce")
 
 
 def validate_required_columns(df):
+    # fail fast with a useful message rather than a random KeyError halfway through
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in df.columns]
     if missing_columns:
         missing = ", ".join(missing_columns)
@@ -40,6 +44,8 @@ def validate_required_columns(df):
 
 
 def build_llm_prompt(company, industry):
+    # keeping the prompt conservative - we only want clear mismatches flagged,
+   
     return f"""
 You are a financial data auditor checking for extraction errors.
 
@@ -59,6 +65,8 @@ SUSPICIOUS
 
 
 def industry_check(company, industry):
+    # fallback when no API key is set - just hardcoded pairs that are obviously wrong
+    # e.g. a cement company listed under software, a bank under manufacturing etc.
     suspicious_pairs = [
         (["cement", "steel", "mining", "textile"], "software"),
         (["bank", "capital", "finance", "insurance"], "manufacturing"),
@@ -75,6 +83,7 @@ def industry_check(company, industry):
 
 
 def call_openai_plausibility(company, industry):
+    # returns None if anything goes wrong so the caller knows to use the fallback
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -91,8 +100,8 @@ def call_openai_plausibility(company, industry):
             messages=[
                 {"role": "user", "content": build_llm_prompt(company, industry)}
             ],
-            temperature=0,
-            max_tokens=3,
+            temperature=0,   # want consistent output, not creative answers
+            max_tokens=3,    # it's one word, 3 tokens is plenty
         )
     except Exception:
         return None
@@ -107,6 +116,7 @@ def call_openai_plausibility(company, industry):
 
 
 def check_llm_plausibility(company, industry):
+    # try the API, fall back to heuristic if it doesn't work
     llm_result = call_openai_plausibility(company, industry)
     if llm_result in {"OK", "WARN"}:
         return llm_result
@@ -117,28 +127,46 @@ def main():
     df = pd.read_excel(INPUT_FILE)
     validate_required_columns(df)
 
+    # numeric versions needed for the validity and outlier checks
     df["revenue_numeric"] = to_numeric(df["REVENUE"])
     df["year_numeric"] = to_numeric(df["timevalue"])
 
+    # compute blank flags once and reuse them below
     revenue_blank = df["REVENUE"].apply(is_blank)
     currency_blank = df["unit_REVENUE"].apply(is_blank)
     year_blank = df["timevalue"].apply(is_blank)
 
+    # ------------------------------------------------------------------
     # Measure 1: Completeness
+    # revenue and currency should always come as a pair - one without the
+    # other is basically useless for any downstream analysis
+    # ------------------------------------------------------------------
     df["flag_completeness"] = (revenue_blank | currency_blank).map({True: "FAIL", False: "OK"})
 
-    # Measure 2: Revenue validity
+    # ------------------------------------------------------------------
+    # Measure 2: Revenue Validity
+    # FAIL = value exists but isn't a number (scraping probably grabbed wrong text)
+    # WARN = negative number, which is unusual but not impossible for some companies
+    # ------------------------------------------------------------------
     df["flag_revenue_validity"] = "OK"
     df.loc[~revenue_blank & df["revenue_numeric"].isna(), "flag_revenue_validity"] = "FAIL"
     df.loc[df["revenue_numeric"] < 0, "flag_revenue_validity"] = "WARN"
 
-    # Measure 3: Year validity
+    # ------------------------------------------------------------------
+    # Measure 3: Year Validity
+    # should be a clean integer between 2000 and 2030
+    # ------------------------------------------------------------------
     valid_year_number = df["year_numeric"].notna() & (df["year_numeric"] % 1 == 0)
     valid_year_range = df["year_numeric"].between(2000, 2030, inclusive="both")
     df["flag_invalid_year"] = "OK"
     df.loc[year_blank | ~valid_year_number | ~valid_year_range, "flag_invalid_year"] = "FAIL"
 
-     # Measure 4: Outlier detection within providerkey groups
+    # ------------------------------------------------------------------
+    # Measure 4: Outlier Detection
+    # compare each revenue against that company's own average, not the whole dataset
+    # similar to PARTITION BY providerkey in SQL
+    # needs at least 3 rows per company, otherwise std deviation isn't meaningful
+    # ------------------------------------------------------------------
     provider_mean = df.groupby("providerkey")["revenue_numeric"].transform("mean")
     provider_std = df.groupby("providerkey")["revenue_numeric"].transform("std")
     provider_count = df.groupby("providerkey")["revenue_numeric"].transform("count")
@@ -148,12 +176,17 @@ def main():
     outlier_base = (
         df["revenue_numeric"].notna()
         & provider_std.notna()
-        & (provider_std > 0)
+        & (provider_std > 0)       # skip if all values are identical (std = 0)
         & (provider_count >= 3)
     )
     df.loc[outlier_base & (z_score > 2), "flag_outlier"] = "WARN"
 
-    # Measure 5: LLM plausibility check with prompt engineering and fallback
+    # ------------------------------------------------------------------
+    # Measure 5: LLM Industry Check
+    # rules can't catch things like "Andhra Cements" being listed as Software
+    # so we use an LLM prompt for that kind of semantic mismatch
+    # cache means we don't call the API multiple times for the same company
+    # ------------------------------------------------------------------
     llm_cache = {}
 
     def cached_llm_check(row):
@@ -179,9 +212,11 @@ def main():
         "5. LLM Industry Mismatch",
     ]
 
+    # issue_count helps prioritise which rows to look at first
     df["issue_count"] = (df[flag_columns] != "OK").sum(axis=1)
     df["flag_overall"] = df["issue_count"].gt(0).map({True: "CHECK", False: "OK"})
 
+    # drop the helper columns we added, they were just for internal calculations
     output_df = df.drop(columns=["revenue_numeric", "year_numeric"])
     output_df.to_excel(OUTPUT_FILE, index=False)
 
